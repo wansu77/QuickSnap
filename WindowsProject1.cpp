@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 // 手动定义缺失的 DXGI 错误码（若 SDK 未提供）
 #ifndef DXGI_ERROR_MODE_CHANGE
@@ -33,11 +34,13 @@
 #define HOTKEY_QUIT       2
 #define MENU_EXIT         1001
 
-// ========== HDR 处理参数 ==========
+// ========== HDR 处理说明 ==========
 // DXGI 在 HDR 模式下输出 scRGB 线性值（Rec.709 原色，无伽马），
-// 1.0 对应 SDR 参考白。因此只需：白点归一化 → sRGB 编码 → 裁剪到 [0,1]，
+// SDR 白的数值 = 系统"SDR 内容亮度"滑块对应亮度 / 80 nits（本机 240 nits 时为 3.0）。
+// 转换只需：白点归一化 → sRGB 编码 → 裁剪到 [0,1]，
 // 不做任何按帧自适应曝光 / 色调映射，即可与 SDR 截图观感一致。
-#define HDR_MODE_CHANGE_GRACE_MS 15000  // 模式切换后多久内的全黑帧视为过渡黑帧
+// 实测 HDR 模式下 DWM 也可能交付 8-bit 帧：数值尺度相同（未归一化的原始 scRGB），
+// 但已做 sRGB 编码，需先解码再归一化。
 
 // ========== 色彩处理函数 ==========
 
@@ -99,6 +102,27 @@ inline float SanitizeFloat(float x) {
     return x;                         // 保留负数
 }
 
+// ---------- HDR 传输查找表 ----------
+// FP16 位模式 → sRGB 字节（含白亮度归一化），65536 项启动/倍率变化时构建一次，
+// 每像素 3 次查表替代 HalfToFloat + powf，4K 单帧从数百毫秒降到几十毫秒
+static BYTE g_LutFp16ToSrgb[65536];
+static BYTE g_LutByteToSrgb[256];   // HDR 桌面的 8-bit 帧回退路径用
+static float g_LutScale = 0.0f;     // 构建查找表时使用的白亮度倍率
+
+void BuildHDRTransferLuts(float scale) {
+    for (UINT32 i = 0; i < 65536; i++) {
+        float v = HalfToFloat(static_cast<uint16_t>(i));
+        if (v != v) v = 0.0f;                     // NaN -> 0
+        v = max(0.0f, v) / scale;
+        g_LutFp16ToSrgb[i] = static_cast<BYTE>(LinearToSRGB(v) * 255.0f + 0.5f);
+    }
+    for (UINT32 i = 0; i < 256; i++) {
+        float v = SRGBToLinear(static_cast<float>(i) / 255.0f) / scale;
+        g_LutByteToSrgb[i] = static_cast<BYTE>(LinearToSRGB(v) * 255.0f + 0.5f);
+    }
+    g_LutScale = scale;
+}
+
 // ========== 全局变量 ==========
 ID3D11Device* g_pD3DDevice = nullptr;
 ID3D11DeviceContext* g_pImmediateContext = nullptr;
@@ -106,11 +130,12 @@ IDXGIOutputDuplication* g_pDeskDupl = nullptr;
 int g_ScreenWidth = 0;
 int g_ScreenHeight = 0;
 bool g_bNeedReinitDXGI = false;
+bool g_bCapturing = false;             // 热键重入保护
+HMONITOR g_hTargetMonitor = nullptr;   // 当前捕获目标显示器（鼠标所在屏）
 
 // 显示模式状态：HDR 开关 / 分辨率变化时用于检测并重建捕获
 DXGI_COLOR_SPACE_TYPE g_LastColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709; // SDR
 float g_SdrWhiteScale = 1.0f;          // 系统"SDR 内容亮度"滑块相对 80 nits 的倍率
-DWORD g_LastModeChangeTick = 0;        // 最近一次模式切换/捕获异常的时间
 
 NOTIFYICONDATA m_nid = {};
 HMENU g_hPopupMenu = nullptr;
@@ -181,6 +206,60 @@ float GetSdrWhiteScale(HMONITOR hMonitor) {
     return 1.0f;
 }
 
+// ---------- 在所有适配器中定位目标显示器对应的适配器与输出 ----------
+// 多屏/混合显卡（Optimus）下输出枚举序号不等于主屏，必须按 HMONITOR 匹配，
+// 且 D3D 设备必须建在输出所在的适配器上，DuplicateOutput 才有效。
+bool FindOutputForMonitor(HMONITOR hTarget, IDXGIAdapter** ppAdapterOut, IDXGIOutput** ppOutputOut) {
+    *ppAdapterOut = nullptr;
+    *ppOutputOut = nullptr;
+    if (!hTarget) return false;
+
+    IDXGIFactory1* pFactory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory)))
+        return false;
+
+    int matchA = -1, matchO = -1;   // HMONITOR 精确匹配
+    int fbA = -1, fbO = -1;         // 回退：第一个活动输出
+    for (UINT a = 0; ; a++) {
+        IDXGIAdapter* pAdapter = nullptr;
+        if (pFactory->EnumAdapters(a, &pAdapter) == DXGI_ERROR_NOT_FOUND)
+            break;
+        for (UINT o = 0; ; o++) {
+            IDXGIOutput* pOutput = nullptr;
+            if (pAdapter->EnumOutputs(o, &pOutput) == DXGI_ERROR_NOT_FOUND)
+                break;
+            DXGI_OUTPUT_DESC d = {};
+            pOutput->GetDesc(&d);
+            if (d.AttachedToDesktop) {
+                if (d.Monitor == hTarget && matchA < 0) { matchA = (int)a; matchO = (int)o; }
+                if (fbA < 0) { fbA = (int)a; fbO = (int)o; }
+            }
+            pOutput->Release();
+        }
+        pAdapter->Release();
+    }
+    pFactory->Release();
+
+    if (matchA < 0) { matchA = fbA; matchO = fbO; }
+    if (matchA < 0) return false;
+
+    // 重新枚举拿到可用接口
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory)))
+        return false;
+    bool ok = false;
+    IDXGIAdapter* pAdapter = nullptr;
+    if (SUCCEEDED(pFactory->EnumAdapters((UINT)matchA, &pAdapter))) {
+        IDXGIOutput* pOutput = nullptr;
+        if (SUCCEEDED(pAdapter->EnumOutputs((UINT)matchO, &pOutput))) {
+            *ppAdapterOut = pAdapter;    // 所有权移交调用方
+            *ppOutputOut = pOutput;
+            ok = true;
+        }
+    }
+    pFactory->Release();
+    return ok;
+}
+
 // ---------- 初始化DXGI（bSilent=true 时不弹窗，用于后台恢复） ----------
 bool InitDXGICapture(bool bSilent = false) {
     // 清理旧资源
@@ -188,10 +267,18 @@ bool InitDXGICapture(bool bSilent = false) {
     if (g_pImmediateContext) { g_pImmediateContext->Release(); g_pImmediateContext = nullptr; }
     if (g_pD3DDevice) { g_pD3DDevice->Release(); g_pD3DDevice = nullptr; }
 
+    IDXGIAdapter* pAdapter = nullptr;
+    IDXGIOutput* pOutput = nullptr;
+    if (!FindOutputForMonitor(g_hTargetMonitor, &pAdapter, &pOutput)) {
+        if (!bSilent) MessageBox(nullptr, L"未找到可捕获的显示器！", L"初始化错误", MB_OK);
+        return false;
+    }
+
+    // 设备建在目标输出所在的适配器上（混合显卡笔记本的输出 0 未必是主屏）
     D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
     HRESULT hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
+        pAdapter,
+        D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         featureLevels,
@@ -201,31 +288,10 @@ bool InitDXGICapture(bool bSilent = false) {
         nullptr,
         &g_pImmediateContext
     );
-    if (FAILED(hr)) {
-        if (!bSilent) MessageBox(nullptr, L"D3D11CreateDevice 失败！", L"初始化错误", MB_OK);
-        return false;
-    }
-
-    IDXGIDevice* pDXGIDevice = nullptr;
-    hr = g_pD3DDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDXGIDevice);
-    if (FAILED(hr)) {
-        if (!bSilent) MessageBox(nullptr, L"QueryInterface(IDXGIDevice) 失败！", L"初始化错误", MB_OK);
-        return false;
-    }
-
-    IDXGIAdapter* pAdapter = nullptr;
-    hr = pDXGIDevice->GetAdapter(&pAdapter);
-    pDXGIDevice->Release();
-    if (FAILED(hr)) {
-        if (!bSilent) MessageBox(nullptr, L"GetAdapter 失败！", L"初始化错误", MB_OK);
-        return false;
-    }
-
-    IDXGIOutput* pOutput = nullptr;
-    hr = pAdapter->EnumOutputs(0, &pOutput);
     pAdapter->Release();
     if (FAILED(hr)) {
-        if (!bSilent) MessageBox(nullptr, L"EnumOutputs 失败！", L"初始化错误", MB_OK);
+        pOutput->Release();
+        if (!bSilent) MessageBox(nullptr, L"D3D11CreateDevice 失败！", L"初始化错误", MB_OK);
         return false;
     }
 
@@ -281,42 +347,33 @@ bool InitDXGICapture(bool bSilent = false) {
     return true;
 }
 
-// ---------- 检测显示模式（HDR 开关 / 分辨率）是否变化 ----------
+// ---------- 检测目标显示器的显示模式（HDR 开关 / 分辨率）是否变化 ----------
 bool CheckOutputChanged() {
-    if (!g_pD3DDevice) return false;
+    if (!g_hTargetMonitor) return false;
 
-    IDXGIDevice* pDXGIDevice = nullptr;
-    if (FAILED(g_pD3DDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDXGIDevice)))
-        return false;
     IDXGIAdapter* pAdapter = nullptr;
-    if (FAILED(pDXGIDevice->GetAdapter(&pAdapter))) {
-        pDXGIDevice->Release();
-        return false;
-    }
-    pDXGIDevice->Release();
-
     IDXGIOutput* pOutput = nullptr;
-    bool changed = false;
-    if (SUCCEEDED(pAdapter->EnumOutputs(0, &pOutput))) {
-        IDXGIOutput6* pOutput6 = nullptr;
-        if (SUCCEEDED(pOutput->QueryInterface(__uuidof(IDXGIOutput6), (void**)&pOutput6))) {
-            DXGI_OUTPUT_DESC1 desc1;
-            if (SUCCEEDED(pOutput6->GetDesc1(&desc1))) {
-                int w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
-                int h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
-                if (desc1.ColorSpace != g_LastColorSpace || w != g_ScreenWidth || h != g_ScreenHeight) {
-                    g_LastColorSpace = desc1.ColorSpace;
-                    g_ScreenWidth = w;
-                    g_ScreenHeight = h;
-                    g_SdrWhiteScale = GetSdrWhiteScale(desc1.Monitor);
-                    changed = true;
-                }
-            }
-            pOutput6->Release();
-        }
-        pOutput->Release();
-    }
+    if (!FindOutputForMonitor(g_hTargetMonitor, &pAdapter, &pOutput))
+        return false;
     pAdapter->Release();
+
+    bool changed = false;
+    IDXGIOutput6* pOutput6 = nullptr;
+    if (SUCCEEDED(pOutput->QueryInterface(__uuidof(IDXGIOutput6), (void**)&pOutput6))) {
+        DXGI_OUTPUT_DESC1 desc1;
+        if (SUCCEEDED(pOutput6->GetDesc1(&desc1))) {
+            int w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
+            int h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
+            if (desc1.ColorSpace != g_LastColorSpace || w != g_ScreenWidth || h != g_ScreenHeight) {
+                g_LastColorSpace = desc1.ColorSpace;
+                g_ScreenWidth = w;
+                g_ScreenHeight = h;
+                changed = true;
+            }
+        }
+        pOutput6->Release();
+    }
+    pOutput->Release();
     return changed;
 }
 
@@ -394,66 +451,56 @@ HRESULT TryCaptureOnce(bool& isBlackOut, HBITMAP& hOutBitmap) {
     bool isHDR = (texDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
         texDesc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT);
 
-    // HDR 桌面判定：实测发现 HDR 模式下 DWM 可能交付两种帧，数值尺度相同（原始 scRGB，
-    // SDR 白 = SDRWhiteLevel/80，本机为 3.0），仅编码不同：
-    //   FP16/FP32 帧：线性值本身
-    //   BGRA8 帧   ：OETF(原始 scRGB)，即已做 sRGB 编码但未做白亮度归一化
-    // SDR 桌面的 BGRA8 帧则是标准 display-referred sRGB（直拷贝即可）。
+    // HDR 桌面判定：HDR 模式下 DWM 可能交付 FP16（线性 scRGB）或 8-bit
+    // （OETF(原始 scRGB)，已编码未归一化）两种帧，数值尺度相同；
+    // SDR 桌面的 8-bit 帧则是标准 display-referred sRGB，直拷贝即可。
     bool hdrDesktop = (g_LastColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
 
     // SDR 白亮度倍率：把系统"SDR 内容亮度"滑块设置归一化回 1.0 = SDR 白
     float whiteScale = (g_SdrWhiteScale >= 0.25f) ? g_SdrWhiteScale : 1.0f;
+    if (g_LutScale != whiteScale) BuildHDRTransferLuts(whiteScale);
 
     for (int y = 0; y < h; y++) {
         BYTE* pSrcRow = reinterpret_cast<BYTE*>(mapped.pData) + y * mapped.RowPitch;
         BYTE* pDstRow = bgraBuffer.data() + y * w * 4;
         for (int x = 0; x < w; x++) {
-            float r, g, b;
             BYTE cb = 0, cg = 0, cbb = 0;
             if (isHDR) {
                 if (texDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                    // 查表直出 sRGB 字节（含负值截断 / NaN 归零 / 白亮度归一化）
                     uint16_t* pHalf = reinterpret_cast<uint16_t*>(pSrcRow + x * 8);
-                    r = HalfToFloat(pHalf[0]);
-                    g = HalfToFloat(pHalf[1]);
-                    b = HalfToFloat(pHalf[2]);
+                    pDstRow[x * 4 + 0] = cb = g_LutFp16ToSrgb[pHalf[2]]; // B
+                    pDstRow[x * 4 + 1] = cg = g_LutFp16ToSrgb[pHalf[1]]; // G
+                    pDstRow[x * 4 + 2] = cbb = g_LutFp16ToSrgb[pHalf[0]]; // R
+                    pDstRow[x * 4 + 3] = 0xFF;
                 }
-                else { // R32G32B32A32_FLOAT
+                else { // R32G32B32A32_FLOAT（少见，走浮点路径）
                     float* pFloat = reinterpret_cast<float*>(pSrcRow + x * 16);
-                    r = pFloat[0];
-                    g = pFloat[1];
-                    b = pFloat[2];
+                    float r = SanitizeFloat(pFloat[0]);
+                    float g = SanitizeFloat(pFloat[1]);
+                    float b = SanitizeFloat(pFloat[2]);
+                    r = LinearToSRGB(max(0.0f, r) / whiteScale);
+                    g = LinearToSRGB(max(0.0f, g) / whiteScale);
+                    b = LinearToSRGB(max(0.0f, b) / whiteScale);
+                    pDstRow[x * 4 + 0] = cb = static_cast<BYTE>(b * 255.0f + 0.5f);
+                    pDstRow[x * 4 + 1] = cg = static_cast<BYTE>(g * 255.0f + 0.5f);
+                    pDstRow[x * 4 + 2] = cbb = static_cast<BYTE>(r * 255.0f + 0.5f);
+                    pDstRow[x * 4 + 3] = 0xFF;
                 }
-                r = SanitizeFloat(r);
-                g = SanitizeFloat(g);
-                b = SanitizeFloat(b);
-                // scRGB 可为负（广色域溢出），截断；再按 SDR 白亮度归一化
-                r = max(0.0f, r) / whiteScale;
-                g = max(0.0f, g) / whiteScale;
-                b = max(0.0f, b) / whiteScale;
-                // 直接 sRGB 编码：与 SDR 路径观感一致，超过 1.0 的 HDR 高光裁剪为白
-                r = LinearToSRGB(r);
-                g = LinearToSRGB(g);
-                b = LinearToSRGB(b);
-                pDstRow[x * 4 + 0] = cb = static_cast<BYTE>(b * 255.0f + 0.5f);
-                pDstRow[x * 4 + 1] = cg = static_cast<BYTE>(g * 255.0f + 0.5f);
-                pDstRow[x * 4 + 2] = cbb = static_cast<BYTE>(r * 255.0f + 0.5f);
-                pDstRow[x * 4 + 3] = 0xFF;
             }
             else if (hdrDesktop) {
-                // HDR 桌面的 8-bit 帧 = OETF(原始 scRGB)：先解码回线性，再与 FP16 相同地归一化
-                b = SRGBToLinear(pSrcRow[x * 4 + 0] / 255.0f) / whiteScale;
-                g = SRGBToLinear(pSrcRow[x * 4 + 1] / 255.0f) / whiteScale;
-                r = SRGBToLinear(pSrcRow[x * 4 + 2] / 255.0f) / whiteScale;
-                b = LinearToSRGB(b);
-                g = LinearToSRGB(g);
-                r = LinearToSRGB(r);
-                pDstRow[x * 4 + 0] = cb = static_cast<BYTE>(b * 255.0f + 0.5f);
-                pDstRow[x * 4 + 1] = cg = static_cast<BYTE>(g * 255.0f + 0.5f);
-                pDstRow[x * 4 + 2] = cbb = static_cast<BYTE>(r * 255.0f + 0.5f);
+                // HDR 桌面的 8-bit 帧 = OETF(原始 scRGB)：查表完成解码 + 归一化 + 再编码
+                pDstRow[x * 4 + 0] = cb = g_LutByteToSrgb[pSrcRow[x * 4 + 0]];
+                pDstRow[x * 4 + 1] = cg = g_LutByteToSrgb[pSrcRow[x * 4 + 1]];
+                pDstRow[x * 4 + 2] = cbb = g_LutByteToSrgb[pSrcRow[x * 4 + 2]];
                 pDstRow[x * 4 + 3] = 0xFF;
             }
             else {
                 memcpy(pDstRow + x * 4, pSrcRow + x * 4, 4);
+                pDstRow[x * 4 + 3] = 0xFF; // 剪贴板位图统一不透明
+                cb = pDstRow[x * 4 + 0];
+                cg = pDstRow[x * 4 + 1];
+                cbb = pDstRow[x * 4 + 2];
             }
             if (cb | cg | cbb) isBlack = false;
         }
@@ -484,9 +531,14 @@ HRESULT TryCaptureOnce(bool& isBlackOut, HBITMAP& hOutBitmap) {
 void CopyBitmapToClipboard(HBITMAP hBitmap) {
     if (RetryOpenClipboard(g_hMainWnd, 5)) {
         EmptyClipboard();
-        SetClipboardData(CF_BITMAP, hBitmap); // 剪贴板接管 hBitmap 的所有权
+        if (!SetClipboardData(CF_BITMAP, hBitmap)) { // 成功后剪贴板接管所有权
+            DeleteObject(hBitmap);                   // 失败则自行释放，避免泄漏
+            ShowBalloonTip(L"QuickSnap", L"写入剪贴板失败");
+        }
+        else {
+            ShowBalloonTip(L"QuickSnap", L"截图已复制到剪贴板");
+        }
         CloseClipboard();
-        ShowBalloonTip(L"QuickSnap", L"截图已复制到剪贴板");
     }
     else {
         DeleteObject(hBitmap);
@@ -505,13 +557,25 @@ bool EnsureDuplication() {
     return true;
 }
 
-// ---------- 截屏复制到剪贴板 ----------
+// ---------- 实际捕获流程 ----------
 void CleanupDXGI();
-void CaptureAndCopyToClipboard() {
+void DoCaptureAndCopy() {
     // 模式切换（HDR 开关）后 DWM 可能持续输出全黑帧零点几秒到几秒，
     // 前 6 次仅重新取帧，之后重建 duplication，仍全黑则提示且不污染剪贴板
     const int maxAttempts = 12;
+    bool bTimeoutRetried = false;
     for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        // 目标显示器 = 鼠标所在屏；跨屏后重建捕获（设备建在对应适配器上）
+        POINT pt = {};
+        GetCursorPos(&pt);
+        HMONITOR hTarget = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        if (hTarget != g_hTargetMonitor) {
+            g_hTargetMonitor = hTarget;
+            g_bNeedReinitDXGI = true;
+        }
+        // 每次捕获刷新白亮度倍率：运行中拖动"SDR 内容亮度"滑块两者不变也会生效
+        g_SdrWhiteScale = GetSdrWhiteScale(hTarget);
+
         // duplication 缺失或已标记失效：重建
         if (!g_pDeskDupl || g_bNeedReinitDXGI) {
             if (!EnsureDuplication()) return; // 本次失败，下次热键再试（不永久放弃）
@@ -520,7 +584,6 @@ void CaptureAndCopyToClipboard() {
         // 主动检测 HDR 开关 / 分辨率变化（避免拿到旧 duplication 的黑帧）
         if (CheckOutputChanged()) {
             OutputDebugString(L"QuickSnap: 检测到显示模式（HDR/SDR）变化，重建捕获\n");
-            g_LastModeChangeTick = GetTickCount();
             CleanupDXGI();
             continue;
         }
@@ -530,12 +593,18 @@ void CaptureAndCopyToClipboard() {
         HRESULT hr = TryCaptureOnce(isBlack, hBitmap);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            // 屏幕完全静止时 duplication 不会推送新帧；
+            // 重建一次 duplication，新建后的第一帧总是立即可得
             if (hBitmap) DeleteObject(hBitmap);
-            return; // 屏幕无更新，不算失败
+            if (!bTimeoutRetried) {
+                bTimeoutRetried = true;
+                CleanupDXGI();
+                continue;
+            }
+            return;
         }
         if (FAILED(hr)) {
             if (hBitmap) DeleteObject(hBitmap);
-            g_LastModeChangeTick = GetTickCount();
             g_bNeedReinitDXGI = true;
             continue; // 重建后重试
         }
@@ -556,6 +625,14 @@ void CaptureAndCopyToClipboard() {
         CopyBitmapToClipboard(hBitmap);
         return;
     }
+}
+
+// ---------- 截屏复制到剪贴板（热键重入保护：捕获期间再按热键直接忽略） ----------
+void CaptureAndCopyToClipboard() {
+    if (g_bCapturing) return;
+    g_bCapturing = true;
+    DoCaptureAndCopy();
+    g_bCapturing = false;
 }
 
 // ---------- 释放资源 ----------
@@ -591,7 +668,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DISPLAYCHANGE:
         g_bNeedReinitDXGI = true;
-        g_LastModeChangeTick = GetTickCount();
         break;
 
     case WM_DESTROY:
@@ -612,6 +688,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ---------- WinMain ----------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+
+    // 初始捕获目标 = 启动时鼠标所在显示器
+    POINT pt = {};
+    GetCursorPos(&pt);
+    g_hTargetMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
 
     if (!InitDXGICapture()) {
         MessageBox(nullptr, L"DXGI 初始化失败！", L"错误", MB_OK);
@@ -667,10 +748,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     startupTip += quitOK ? quitKey : L"退出热键失效";
     ShowBalloonTip(L"QuickSnap", startupTip.c_str());
 
-    // 调试模式：WindowsProject1.exe test 启动后自动截一次图
-    if (lpCmdLine && strstr(lpCmdLine, "test")) {
-        Sleep(1500);
-        CaptureAndCopyToClipboard();
+    // 调试模式：WindowsProject1.exe test 启动后自动截一次图（按参数 token 精确匹配）
+    if (lpCmdLine) {
+        char cmdBuf[256] = {};
+        strncpy_s(cmdBuf, lpCmdLine, _TRUNCATE);
+        char* next = nullptr;
+        for (char* tok = strtok_s(cmdBuf, " \t", &next); tok; tok = strtok_s(nullptr, " \t", &next)) {
+            if (strcmp(tok, "test") == 0) {
+                Sleep(1500);
+                CaptureAndCopyToClipboard();
+                break;
+            }
+            if (strcmp(tok, "test2") == 0) {
+                // 静止屏连续两次截图：第二次应通过超时重建 duplication 恢复
+                Sleep(1500);
+                CaptureAndCopyToClipboard();
+                Sleep(1200);
+                CaptureAndCopyToClipboard();
+                break;
+            }
+        }
     }
 
     MSG msgLoop;
