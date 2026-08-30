@@ -1,0 +1,16 @@
+# Visual Studio 缓存
+.vs/
+ipch/
+*.suo
+*.user
+*.aps
+*.opt
+
+# 编译输出
+x64/
+Debug/
+Release/
+*.obj
+*.exe
+*.pdb
+*.ilk
